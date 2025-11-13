@@ -5,6 +5,7 @@ Development guidelines and best practices for this project.
 For node: use 'bun' and 'typescript'
 
 For python: use 'uv' and 'pydantic'
+
 ---
 
 ## SOLID Principles
