@@ -1,5 +1,7 @@
 # CLAUDE.md - Development Guidelines
 
+@AGENTS.md
+
 Development guidelines and best practices for this project.
 
 For node: use 'bun' and 'typescript'
