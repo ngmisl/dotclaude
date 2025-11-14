@@ -53,3 +53,10 @@ Running the scanner ensures your prompts and agents are safe before integrating 
 ## Agent Sources
 
 - [ClaudeCodeAgents](https://github.com/darcyegb/ClaudeCodeAgents)
+
+## Support
+
+- [Donate](https://fourzerofour.fkey.id)
+- [Farcaster Social Media](https://farcaster.xyz/~/code/I1TPIM) (ref)
+- [Private Wallet](https://i.fluidkey.com/SZC2U1) (ref)
+- [AI Trading Bot FREE](https://senpi.ai/?r=M1977) (ref)
