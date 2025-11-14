@@ -1,0 +1,469 @@
+package main
+
+import (
+	"encoding/base64"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+// Finding represents a single detection
+type Finding struct {
+	Type     string
+	Severity string
+	Line     int
+	Column   int
+	Context  string
+	Details  string
+}
+
+// FileReport represents all findings for a file
+type FileReport struct {
+	Path     string
+	Findings []Finding
+}
+
+// ScanReport represents the complete scan results
+type ScanReport struct {
+	TotalFiles   int
+	ScannedFiles int
+	CleanFiles   int
+	FileReports  []FileReport
+}
+
+var (
+	zeroWidthChars = []rune{
+		'\u200B', '\u200C', '\u200D', '\uFEFF', '\u180E',
+	}
+
+	directionOverrides = []rune{
+		'\u202A', '\u202B', '\u202C', '\u202D', '\u202E',
+		'\u2066', '\u2067', '\u2068', '\u2069',
+	}
+
+	base64Pattern = regexp.MustCompile(`[A-Za-z0-9+/]{20,}={0,2}`)
+
+	supportedExts = map[string]bool{
+		".xml": true, ".md": true, ".yaml": true, ".yml": true, ".txt": true,
+	}
+)
+
+func main() {
+	rootDir := "."
+	if len(os.Args) > 1 {
+		rootDir = os.Args[1]
+	}
+
+	fmt.Printf("🔍 Scanning directory: %s\n\n", rootDir)
+	report := scanDirectory(rootDir)
+	printReport(report)
+}
+
+func scanDirectory(root string) ScanReport {
+	report := ScanReport{}
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			// Skip only specific directories
+			skipDirs := []string{"node_modules", "vendor", ".git", "dist", "build", ".next"}
+			for _, skip := range skipDirs {
+				if name == skip {
+					return fs.SkipDir
+				}
+			}
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if supportedExts[ext] {
+			report.TotalFiles++
+			if fileReport := scanFile(path); fileReport != nil {
+				report.ScannedFiles++
+				if len(fileReport.Findings) > 0 {
+					report.FileReports = append(report.FileReports, *fileReport)
+				} else {
+					report.CleanFiles++
+				}
+			}
+		}
+		return nil
+	})
+	return report
+}
+
+func scanFile(path string) *FileReport {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	if !utf8.Valid(content) {
+		return &FileReport{
+			Path: path,
+			Findings: []Finding{{
+				Type: "Invalid Encoding", Severity: "HIGH", Line: 0,
+				Details: "File contains invalid UTF-8 sequences",
+			}},
+		}
+	}
+	report := &FileReport{Path: path}
+	lines := strings.Split(string(content), "\n")
+	for lineNum, line := range lines {
+		lineNum++
+		report.Findings = append(report.Findings, detectHiddenChars(line, lineNum)...)
+		report.Findings = append(report.Findings, detectControlChars(line, lineNum)...)
+		report.Findings = append(report.Findings, detectBase64(line, lineNum)...)
+		report.Findings = append(report.Findings, detectWhitespaceAnomalies(line, lineNum)...)
+		report.Findings = append(report.Findings, detectHomoglyphs(line, lineNum)...)
+	}
+	return report
+}
+
+func detectHiddenChars(line string, lineNum int) []Finding {
+	var findings []Finding
+	for i, r := range line {
+		for _, zw := range zeroWidthChars {
+			if r == zw {
+				findings = append(findings, Finding{
+					Type: "Zero-Width Character", Severity: "HIGH",
+					Line: lineNum, Column: i + 1,
+					Context: truncateContext(line, i, 40),
+					Details: fmt.Sprintf("U+%04X (%s)", r, getCharName(r)),
+				})
+			}
+		}
+		for _, dir := range directionOverrides {
+			if r == dir {
+				findings = append(findings, Finding{
+					Type: "Direction Override", Severity: "HIGH",
+					Line: lineNum, Column: i + 1,
+					Context: truncateContext(line, i, 40),
+					Details: fmt.Sprintf("U+%04X (%s)", r, getCharName(r)),
+				})
+			}
+		}
+	}
+	return findings
+}
+
+func detectControlChars(line string, lineNum int) []Finding {
+	var findings []Finding
+	for i, r := range line {
+		if r == '\t' || r == '\n' || r == '\r' {
+			continue
+		}
+		if (r >= 0x00 && r <= 0x1F) || (r >= 0x7F && r <= 0x9F) {
+			findings = append(findings, Finding{
+				Type: "Control Character", Severity: "MEDIUM",
+				Line: lineNum, Column: i + 1,
+				Context: truncateContext(line, i, 40),
+				Details: fmt.Sprintf("U+%04X", r),
+			})
+		}
+	}
+	return findings
+}
+
+func detectBase64(line string, lineNum int) []Finding {
+	var findings []Finding
+	matches := base64Pattern.FindAllStringIndex(line, -1)
+	for _, match := range matches {
+		candidate := line[match[0]:match[1]]
+		decoded, err := base64.StdEncoding.DecodeString(candidate)
+		if err != nil {
+			decoded, err = base64.URLEncoding.DecodeString(candidate)
+			if err != nil {
+				continue
+			}
+		}
+		if len(decoded) > 0 {
+			decodedStr := string(decoded)
+			severity := "LOW"
+			suspiciousKeywords := []string{
+				"exec", "eval", "system", "import", "require",
+				"<script", "javascript:", "data:", "cmd",
+				"ignore", "disregard", "override", "bypass",
+			}
+			for _, keyword := range suspiciousKeywords {
+				if strings.Contains(strings.ToLower(decodedStr), keyword) {
+					severity = "HIGH"
+					break
+				}
+			}
+			findings = append(findings, Finding{
+				Type: "Base64 Encoded Content", Severity: severity,
+				Line: lineNum, Column: match[0] + 1,
+				Context: truncateContext(line, match[0], 40),
+				Details: fmt.Sprintf("Decoded: %s", truncateString(decodedStr, 100)),
+			})
+		}
+	}
+	return findings
+}
+
+func detectWhitespaceAnomalies(line string, lineNum int) []Finding {
+	var findings []Finding
+	spacePattern := regexp.MustCompile(`[ ]{4,}`)
+	matches := spacePattern.FindAllStringIndex(line, -1)
+	for _, match := range matches {
+		count := match[1] - match[0]
+		if count > 10 {
+			findings = append(findings, Finding{
+				Type: "Excessive Spaces", Severity: "LOW",
+				Line: lineNum, Column: match[0] + 1,
+				Context: truncateContext(line, match[0], 40),
+				Details: fmt.Sprintf("%d consecutive spaces", count),
+			})
+		}
+	}
+	tabPattern := regexp.MustCompile(`\t{3,}`)
+	matches = tabPattern.FindAllStringIndex(line, -1)
+	for _, match := range matches {
+		count := match[1] - match[0]
+		findings = append(findings, Finding{
+			Type: "Excessive Tabs", Severity: "LOW",
+			Line: lineNum, Column: match[0] + 1,
+			Context: truncateContext(line, match[0], 40),
+			Details: fmt.Sprintf("%d consecutive tabs", count),
+		})
+	}
+	return findings
+}
+
+func detectHomoglyphs(line string, lineNum int) []Finding {
+	var findings []Finding
+	homoglyphs := map[rune]string{
+		'\u0430': "Cyrillic 'a'", '\u0435': "Cyrillic 'e'",
+		'\u043E': "Cyrillic 'o'", '\u0440': "Cyrillic 'p'",
+		'\u0441': "Cyrillic 'c'", '\u0445': "Cyrillic 'x'",
+		'\u0443': "Cyrillic 'y'", '\u0391': "Greek Alpha",
+		'\u0392': "Greek Beta", '\u0395': "Greek Epsilon",
+		'\u0397': "Greek Eta",
+	}
+	for i, r := range line {
+		if desc, isHomoglyph := homoglyphs[r]; isHomoglyph {
+			findings = append(findings, Finding{
+				Type: "Homoglyph Character", Severity: "MEDIUM",
+				Line: lineNum, Column: i + 1,
+				Context: truncateContext(line, i, 40),
+				Details: fmt.Sprintf("U+%04X: %s", r, desc),
+			})
+		}
+	}
+	return findings
+}
+
+func getCharName(r rune) string {
+	names := map[rune]string{
+		'\u200B': "ZERO WIDTH SPACE",
+		'\u200C': "ZERO WIDTH NON-JOINER",
+		'\u200D': "ZERO WIDTH JOINER",
+		'\uFEFF': "ZERO WIDTH NO-BREAK SPACE",
+		'\u180E': "MONGOLIAN VOWEL SEPARATOR",
+		'\u202A': "LEFT-TO-RIGHT EMBEDDING",
+		'\u202B': "RIGHT-TO-LEFT EMBEDDING",
+		'\u202C': "POP DIRECTIONAL FORMATTING",
+		'\u202D': "LEFT-TO-RIGHT OVERRIDE",
+		'\u202E': "RIGHT-TO-LEFT OVERRIDE",
+		'\u2066': "LEFT-TO-RIGHT ISOLATE",
+		'\u2067': "RIGHT-TO-LEFT ISOLATE",
+		'\u2068': "FIRST STRONG ISOLATE",
+		'\u2069': "POP DIRECTIONAL ISOLATE",
+	}
+	if name, ok := names[r]; ok {
+		return name
+	}
+	return "UNKNOWN"
+}
+
+func truncateContext(line string, pos, maxLen int) string {
+	start, end := pos-maxLen/2, pos+maxLen/2
+	if start < 0 {
+		start = 0
+	}
+	if end > len(line) {
+		end = len(line)
+	}
+	context := line[start:end]
+	if start > 0 {
+		context = "..." + context
+	}
+	if end < len(line) {
+		context += "..."
+	}
+	return strings.ReplaceAll(context, "\t", "→")
+}
+
+func truncateString(s string, maxLen int) string {
+	var clean strings.Builder
+	for _, r := range s {
+		if unicode.IsPrint(r) || r == ' ' || r == '\t' || r == '\n' {
+			clean.WriteRune(r)
+		} else {
+			clean.WriteString(fmt.Sprintf("\\u%04x", r))
+		}
+	}
+	result := clean.String()
+	if len(result) > maxLen {
+		return result[:maxLen] + "..."
+	}
+	return result
+}
+
+func printReport(report ScanReport) {
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+	fmt.Println("                    SCAN REPORT SUMMARY")
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+	fmt.Printf("Total files found:    %d\n", report.TotalFiles)
+	fmt.Printf("Files scanned:        %d\n", report.ScannedFiles)
+	fmt.Printf("Clean files:          %d\n", report.CleanFiles)
+	fmt.Printf("Files with findings:  %d\n", len(report.FileReports))
+	fmt.Println()
+
+	if len(report.FileReports) == 0 {
+		fmt.Println("✅ No suspicious content detected!")
+		return
+	}
+
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+	fmt.Println("                    DETAILED FINDINGS")
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+
+	for _, fileReport := range report.FileReports {
+		printFileReport(fileReport)
+	}
+	printStatistics(report)
+	printFilesToCheck(report)
+}
+
+func printFileReport(report FileReport) {
+	fmt.Printf("\n📄 File: %s\n", report.Path)
+	fmt.Printf("   Found %d issue(s)\n\n", len(report.Findings))
+
+	for i, finding := range report.Findings {
+		severity := getSeveritySymbol(finding.Severity)
+		fmt.Printf("   %s [%s] %s\n", severity, finding.Severity, finding.Type)
+		fmt.Printf("      Location: Line %d, Column %d\n", finding.Line, finding.Column)
+		if finding.Context != "" {
+			fmt.Printf("      Context:  %q\n", finding.Context)
+		}
+		if finding.Details != "" {
+			fmt.Printf("      Details:  %s\n", finding.Details)
+		}
+		if i < len(report.Findings)-1 {
+			fmt.Println()
+		}
+	}
+	fmt.Println()
+}
+
+func printStatistics(report ScanReport) {
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+	fmt.Println("                    STATISTICS BY TYPE")
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+
+	stats := make(map[string]int)
+	severityStats := make(map[string]int)
+
+	for _, fileReport := range report.FileReports {
+		for _, finding := range fileReport.Findings {
+			stats[finding.Type]++
+			severityStats[finding.Severity]++
+		}
+	}
+
+	fmt.Println("\nBy Type:")
+	for typ, count := range stats {
+		fmt.Printf("  %-30s: %d\n", typ, count)
+	}
+
+	fmt.Println("\nBy Severity:")
+	for severity, count := range severityStats {
+		fmt.Printf("  %s %-10s: %d\n", getSeveritySymbol(severity), severity, count)
+	}
+	fmt.Println()
+}
+
+func printFilesToCheck(report ScanReport) {
+	if len(report.FileReports) == 0 {
+		return
+	}
+
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+	fmt.Println("              FILES TO MANUALLY REVIEW")
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+	fmt.Println()
+
+	// Group by severity
+	highFiles := []string{}
+	mediumFiles := []string{}
+	lowFiles := []string{}
+
+	for _, fileReport := range report.FileReports {
+		hasHigh := false
+		hasMedium := false
+		hasLow := false
+
+		for _, finding := range fileReport.Findings {
+			switch finding.Severity {
+			case "HIGH":
+				hasHigh = true
+			case "MEDIUM":
+				hasMedium = true
+			case "LOW":
+				hasLow = true
+			}
+		}
+
+		if hasHigh {
+			highFiles = append(highFiles, fileReport.Path)
+		} else if hasMedium {
+			mediumFiles = append(mediumFiles, fileReport.Path)
+		} else if hasLow {
+			lowFiles = append(lowFiles, fileReport.Path)
+		}
+	}
+
+	if len(highFiles) > 0 {
+		fmt.Println("🔴 HIGH PRIORITY - Review immediately:")
+		for _, path := range highFiles {
+			fmt.Printf("   %s\n", path)
+		}
+		fmt.Println()
+	}
+
+	if len(mediumFiles) > 0 {
+		fmt.Println("🟡 MEDIUM PRIORITY - Review when possible:")
+		for _, path := range mediumFiles {
+			fmt.Printf("   %s\n", path)
+		}
+		fmt.Println()
+	}
+
+	if len(lowFiles) > 0 {
+		fmt.Println("🔵 LOW PRIORITY - Review if concerned:")
+		for _, path := range lowFiles {
+			fmt.Printf("   %s\n", path)
+		}
+		fmt.Println()
+	}
+}
+
+func getSeveritySymbol(severity string) string {
+	switch severity {
+	case "HIGH":
+		return "🔴"
+	case "MEDIUM":
+		return "🟡"
+	case "LOW":
+		return "🔵"
+	default:
+		return "⚪"
+	}
+}
