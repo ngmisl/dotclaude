@@ -5,7 +5,7 @@
 🤖 dotclaude - A curated collection of Claude Code agents, prompts & development guidelines
 
 Features:
-✨ Opinionated CLAUDE.md with SOLID principles
+✨ Opinionated CLAUDEMD with SOLID principles
 🛠️ Pre-built specialized agents
 🔒 Built-in prompt sanitizer (detects hidden malicious content)
 
