@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io/fs"
 	"os"
@@ -9,12 +11,28 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 )
 
 type charDetector struct {
 	chars    []rune
 	name     string
 	severity string
+}
+
+type Config struct {
+	IgnoredDirectories []string `yaml:"ignored_directories"`
+	SupportedExtensions []string `yaml:"supported_extensions"`
+}
+
+type Issue struct {
+	FilePath    string `json:"file_path"`
+	Line        int    `json:"line"`
+	Column      int    `json:"column"`
+	Severity    string `json:"severity"`
+	Type        string `json:"type"`
+	Details     string `json:"details"`
 }
 
 var (
@@ -36,30 +54,63 @@ var (
 		},
 	}
 
-	base64Pattern = regexp.MustCompile(`[A-Za-z0-9+/]{20,}={0,2}`)
+	base64Pattern = regexp.MustCompile(`[A-Za-z0-9+/]{10,}={0,2}`)
 	
-	supportedExts = map[string]bool{
-		".xml": true, ".md": true, ".yaml": true, ".yml": true, ".txt": true,
-	}
+	supportedExts = make(map[string]bool)
+	issues        = []Issue{}
 
 	totalFiles      = 0
 	scannedFiles    = 0
 	filesWithIssues = 0
 	issueCount      = 0
+	hasHighSeverityIssue = false
 )
 
-func main() {
-	rootDir := "."
-	if len(os.Args) > 1 {
-		rootDir = os.Args[1]
+func loadConfig(path string) (*Config, error) {
+	config := &Config{}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
-
-	fmt.Printf("🔍 Scanning directory: %s\n\n", rootDir)
-	scanDirectory(rootDir)
-	printSummary()
+	err = yaml.Unmarshal(content, config)
+	if err != nil {
+		return nil, err
+	}
+	return config, nil
 }
 
-func scanDirectory(root string) {
+func main() {
+	outputFormat := flag.String("output", "text", "Output format (text or json)")
+	flag.Parse()
+
+	config, err := loadConfig("config.yaml")
+	if err != nil {
+		fmt.Printf("Error loading config.yaml: %v\n", err)
+		os.Exit(1)
+	}
+
+	for _, ext := range config.SupportedExtensions {
+		supportedExts[ext] = true
+	}
+
+	rootDir := "."
+	if flag.NArg() > 0 {
+		rootDir = flag.Arg(0)
+	}
+
+	if *outputFormat == "text" {
+		fmt.Printf("🔍 Scanning directory: %s\n\n", rootDir)
+	}
+	
+	scanDirectory(rootDir, config.IgnoredDirectories)
+	printSummary(*outputFormat)
+
+	if hasHighSeverityIssue {
+		os.Exit(1)
+	}
+}
+
+func scanDirectory(root string, ignoredDirs []string) {
 	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -67,8 +118,7 @@ func scanDirectory(root string) {
 
 		if d.IsDir() {
 			name := d.Name()
-			skip := []string{"node_modules", "vendor", ".git", "dist", "build", ".next"}
-			for _, s := range skip {
+			for _, s := range ignoredDirs {
 				if name == s {
 					return fs.SkipDir
 				}
@@ -84,6 +134,20 @@ func scanDirectory(root string) {
 	})
 }
 
+func addIssue(path string, line, col int, severity, issueType, details string) {
+	issues = append(issues, Issue{
+		FilePath: path,
+		Line:     line,
+		Column:   col,
+		Severity: severity,
+		Type:     issueType,
+		Details:  details,
+	})
+	if severity == "HIGH" {
+		hasHighSeverityIssue = true
+	}
+}
+
 func scanFile(path string) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -91,38 +155,29 @@ func scanFile(path string) {
 	}
 
 	if !utf8.Valid(content) {
-		printIssue(path, 0, "HIGH", "Invalid UTF-8", "File contains invalid UTF-8 sequences")
+		addIssue(path, 0, 0, "HIGH", "Invalid UTF-8", "File contains invalid UTF-8 sequences")
 		return
 	}
 
 	scannedFiles++
 	lines := strings.Split(string(content), "\n")
-	fileIssues := 0
-
+	
 	for lineNum, line := range lines {
 		lineNum++
 		
 		// Character-based detection
 		for i, r := range line {
+			col := i + 1
 			// Control characters (skip normal whitespace)
 			if r != '\t' && r != '\n' && r != '\r' && ((r >= 0x00 && r <= 0x1F) || (r >= 0x7F && r <= 0x9F)) {
-				if fileIssues == 0 {
-					fmt.Printf("\n📄 %s\n", path)
-				}
-				fileIssues++
-				fmt.Printf("  🟡 L%d:C%d MEDIUM Control Char U+%04X\n", lineNum, i+1, r)
+				addIssue(path, lineNum, col, "MEDIUM", "Control Char", fmt.Sprintf("U+%04X", r))
 			}
 
 			// Run through detectors
 			for _, det := range detectors {
 				for _, char := range det.chars {
 					if r == char {
-						if fileIssues == 0 {
-							fmt.Printf("\n📄 %s\n", path)
-						}
-						fileIssues++
-						symbol := severitySymbol(det.severity)
-						fmt.Printf("  %s L%d:C%d %s %s U+%04X\n", symbol, lineNum, i+1, det.severity, det.name, r)
+						addIssue(path, lineNum, col, det.severity, det.name, fmt.Sprintf("U+%04X", r))
 					}
 				}
 			}
@@ -131,6 +186,7 @@ func scanFile(path string) {
 		// Base64 detection
 		matches := base64Pattern.FindAllStringIndex(line, -1)
 		for _, match := range matches {
+			col := match[0] + 1
 			candidate := line[match[0]:match[1]]
 			decoded, err := base64.StdEncoding.DecodeString(candidate)
 			if err != nil {
@@ -144,7 +200,6 @@ func scanFile(path string) {
 				decodedStr := string(decoded)
 				severity := "LOW"
 				
-				// Check for dangerous patterns
 				dangerous := []string{"exec(", "eval(", "system(", "__import__", "<script", "javascript:", "data:text/html"}
 				for _, keyword := range dangerous {
 					if strings.Contains(strings.ToLower(decodedStr), keyword) {
@@ -152,49 +207,42 @@ func scanFile(path string) {
 						break
 					}
 				}
-
-				if fileIssues == 0 {
-					fmt.Printf("\n📄 %s\n", path)
-				}
-				fileIssues++
-				symbol := severitySymbol(severity)
+				
 				snippet := decodedStr
 				if len(snippet) > 60 {
 					snippet = snippet[:60] + "..."
 				}
-				fmt.Printf("  %s L%d:C%d %s Base64: %s\n", symbol, lineNum, match[0]+1, severity, snippet)
+				addIssue(path, lineNum, col, severity, "Base64", snippet)
 			}
 		}
 	}
+}
 
-	if fileIssues > 0 {
-		filesWithIssues++
-		issueCount += fileIssues
+func printSummary(format string) {
+	if format == "json" {
+		jsonIssues, err := json.MarshalIndent(issues, "", "  ")
+		if err != nil {
+			fmt.Printf("Error marshalling issues to JSON: %v\n", err)
+			return
+		}
+		fmt.Println(string(jsonIssues))
+		return
 	}
-}
 
-func severitySymbol(severity string) string {
-	switch severity {
-	case "HIGH":
-		return "🔴"
-	case "MEDIUM":
-		return "🟡"
-	case "LOW":
-		return "🔵"
-	default:
-		return "⚪"
+	// Human-readable summary
+	issueCount = len(issues)
+	filesWithIssuesMap := make(map[string]bool)
+	for _, issue := range issues {
+		filesWithIssuesMap[issue.FilePath] = true
 	}
-}
+	filesWithIssues = len(filesWithIssuesMap)
 
-func printIssue(path string, line int, severity, issueType, details string) {
-	symbol := severitySymbol(severity)
-	fmt.Printf("\n📄 %s\n", path)
-	fmt.Printf("  %s L%d %s %s: %s\n", symbol, line, severity, issueType, details)
-	filesWithIssues++
-	issueCount++
-}
+	for _, issue := range issues {
+		symbol := severitySymbol(issue.Severity)
+		fmt.Printf("\n📄 %s\n", issue.FilePath)
+		fmt.Printf("  %s L%d:%d %s %s: %s\n", symbol, issue.Line, issue.Column, issue.Severity, issue.Type, issue.Details)
+	}
 
-func printSummary() {
 	fmt.Println("\n═══════════════════════════════════════════════════════════════")
 	fmt.Println("                    SCAN SUMMARY")
 	fmt.Println("═══════════════════════════════════════════════════════════════")
@@ -211,4 +259,17 @@ func printSummary() {
 		fmt.Println("   Review the files listed above")
 	}
 	fmt.Println()
+}
+
+func severitySymbol(severity string) string {
+	switch severity {
+	case "HIGH":
+		return "🔴"
+	case "MEDIUM":
+		return "🟡"
+	case "LOW":
+		return "🔵"
+	default:
+		return "⚪"
+	}
 }

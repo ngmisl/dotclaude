@@ -1,0 +1,14 @@
+ignored_directories:
+  - "node_modules"
+  - "vendor"
+  - ".git"
+  - "dist"
+  - "build"
+  - ".next"
+
+supported_extensions:
+  - ".xml"
+  - ".md"
+  - ".yaml"
+  - ".yml"
+  - ".txt"
