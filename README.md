@@ -1,3 +1,5 @@
+[![CodeQL Advanced](https://github.com/ngmisl/dotclaude/actions/workflows/codeql.yml/badge.svg)](https://github.com/ngmisl/dotclaude/actions/workflows/codeql.yml)
+
 # dotclaude
 
 A curated collection of AI development agents and prompts to enhance your AI-assisted development workflow, supporting both Claude Code and Gemini CLI.
