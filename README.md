@@ -1,4 +1,4 @@
-[![CodeQL Advanced](https://github.com/ngmisl/dotclaude/actions/workflows/codeql.yml/badge.svg)](https://github.com/ngmisl/dotclaude/actions/workflows/codeql.yml)
+[![CodeQL Advanced](https://github.com/ngmisl/dotclaude/actions/workflows/codeql.yml/badge.svg)](https://github.com/ngmisl/dotclaude/actions/workflows/codeql.yml) [![Go](https://github.com/ngmisl/dotclaude/actions/workflows/go.yml/badge.svg)](https://github.com/ngmisl/dotclaude/actions/workflows/go.yml)
 
 # dotclaude
 
